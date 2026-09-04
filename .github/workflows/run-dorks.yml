@@ -1,4 +1,4 @@
-name: Scale-Out Dork Matrix (20-Worker)
+name: Scale-Out Dork Matrix
 
 on:
   workflow_dispatch:
@@ -7,61 +7,70 @@ permissions:
   contents: write
 
 jobs:
-  # Master Controller Host
+  # Job 1: Run the central Master Dashboard
   master-dashboard:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install Flask & Requests
-        run: pip install flask requests
+      - name: Install Dependencies
+        run: |
+          pip install flask requests
 
       - name: Install and Start Cloudflare Tunnel
         run: |
           curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
-          # Expose local Flask Port 5000 (The Master UI)
+          # Master dashboard runs on Port 5000
           cloudflared tunnel --url http://localhost:5000 > cloudflare_tunnel.log 2>&1 &
-          echo "Cloudflare Tunnel started for Master Dashboard."
+          echo "Cloudflare Tunnel started."
 
-      - name: Launch Master Dashboard Server
+      - name: Wait for Tunnel and Publish URL
         run: |
-          # Start the master dashboard in background
-          python master_dashboard.py &
-          sleep 6
+          echo "Waiting for Cloudflare Tunnel to generate URL..."
+          sleep 10
+          MASTER_URL=""
+          for i in {1..15}; do
+            MASTER_URL=$(grep -o 'https://[^ ]*\.trycloudflare\.com' cloudflare_tunnel.log | head -n 1)
+            if [ ! -z "$MASTER_URL" ]; then
+              break
+            fi
+            sleep 2
+          done
           
-          # Grab the assigned public tunnel URL
-          TUNNEL_URL=$(grep -o 'https://[^ ]*\.trycloudflare\.com' cloudflare_tunnel.log | head -n 1)
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "Cloudflare Tunnel URL not found in log, printing log:"
+          if [ -z "$MASTER_URL" ]; then
+            echo "Failed to get Cloudflare URL!"
             cat cloudflare_tunnel.log
             exit 1
           fi
           
-          echo "=================================================="
-          echo "MASTER CONTROLLER IS RUNNING!"
-          echo "OPEN THIS SINGLE URL ON YOUR PHONE OR PC:"
-          echo "$TUNNEL_URL"
-          echo "=================================================="
+          echo "MASTER URL IS: $MASTER_URL"
+          echo "$MASTER_URL" > master_url.txt
           
-          # Commit the master URL to the repo so workers can find it
+          # Publish URL to Git so workers can read it
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          echo "$TUNNEL_URL" > master_url.txt
           git add master_url.txt
           git commit -m "Publish Master Control URL [skip ci]" || true
-          git push origin HEAD:main --force
-          
-          # Keep the dashboard running
-          wait -n
+          git push origin HEAD:${{ github.ref_name }} --force || true
 
-  # 20 Parallel Worker runners that connect to Master
+      - name: Run Master Dashboard
+        run: |
+          echo "=================================================="
+          echo "MASTER DASHBOARD IS NOW ONLINE!"
+          echo "URL: $(cat master_url.txt)"
+          echo "=================================================="
+          python master_dashboard.py
+
+  # Job 2: Run 20 parallel workers
   run-worker:
     needs: master-dashboard
     runs-on: ubuntu-latest
@@ -78,7 +87,7 @@ jobs:
         run: |
           INDEX=$(printf "%02d" ${{ matrix.chunk }})
           if [ -d "progress/chunk_${INDEX}" ]; then
-            echo "Restoring state files for chunk ${INDEX}..."
+            echo "Loading checkpoint files for chunk ${INDEX}..."
             cp -r progress/chunk_${INDEX}/* . || true
           fi
 
@@ -88,30 +97,30 @@ jobs:
           INDEX=$(printf "%02d" ${{ matrix.chunk }})
           if [ -f "chunks/dorks_${INDEX}.txt" ]; then
             mv "chunks/dorks_${INDEX}.txt" my_dorks.txt
-            echo "Loaded chunk ${INDEX} with $(wc -l < my_dorks.txt) dorks."
+            echo "Successfully loaded dorks_${INDEX}.txt as my_dorks.txt"
+            wc -l my_dorks.txt
           else
             echo "No dorks file found for chunk ${INDEX}. Creating empty file."
             touch my_dorks.txt
           fi
 
-      - name: Write SearXNG Settings (Enable Google CSE)
+      - name: Configure SearXNG Settings
         run: |
+          # Create a basic settings.yml that enables google cse
           mkdir -p searxng_config
-          cat << 'EOF' > settings.yml
+          cat <<EOF > searxng_config/settings.yml
           use_default_settings: true
           engines:
             - name: google cse
               engine: google_cse
-              shortcut: gcs
-              categories: general
-              timeout: 10.0
-              disabled: false
+              shortcut: ggo
+              active: true
           EOF
 
       - name: Start SearXNG Container
         run: |
-          docker run -d -p 8080:8080 -v $(pwd)/settings.yml:/etc/searxng/settings.yml --name searxng searxng/searxng
-          echo "Waiting for SearXNG to initialize..."
+          docker run -d -p 8080:8080 -v $(pwd)/searxng_config/settings.yml:/etc/searxng/settings.yml --name searxng searxng/searxng
+          echo "Waiting for SearXNG to be ready..."
           until $(curl --output /dev/null --silent --head --fail http://localhost:8080); do
             printf '.'
             sleep 2
@@ -128,21 +137,31 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 flask
 
-      - name: Start Cloudflare Tunnel for Worker
+      - name: Start Cloudflare Tunnel
         run: |
           curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
-          # Expose local Flask Port 5000 (The Worker UI)
+          # Workers run dork_html_safe.py on port 5000
           cloudflared tunnel --url http://localhost:5000 > cloudflare_tunnel.log 2>&1 &
-          echo "Cloudflare Tunnel initiated for worker."
+          echo "Cloudflare Tunnel successfully initiated."
 
-      - name: Run Background Agent and Dork Worker
+      - name: Run Web UI Worker & Telemetry Agent
         run: |
-          # Start the status reporter agent in the background
-          python worker_agent.py ${{ matrix.chunk }} ${{ github.repository }} &
+          # 1. Start the main V11 Python script in the background
+          python dork_html_safe.py &
           
-          # Start your V11 dork worker (it starts on port 5000)
-          python dork_html_safe.py
+          # 2. Start the telemetry agent in the background to report to Master
+          python worker_agent.py ${{ matrix.chunk }} ${{ github.repository }} ${{ github.ref_name }} &
+          
+          # 3. Print the local worker URL for fallback manual access
+          sleep 8
+          echo "=================================================="
+          echo "WORKER JOB #${{ matrix.chunk }} LOCAL URL:"
+          grep -o 'https://[^ ]*\.trycloudflare\.com' cloudflare_tunnel.log || cat cloudflare_tunnel.log
+          echo "=================================================="
+          
+          # Keep runner alive as long as python script is running
+          wait -n
 
       - name: Save Chunk Progress to Workspace Folder
         if: always()
@@ -172,12 +191,12 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add "progress/chunk_${INDEX}/"
           
-          # Multi-user Git collision avoidance retries
-          for i in {1..8}; do
-            git fetch origin main
-            git rebase origin/main || { git rebase --abort; git pull --rebase origin main; }
+          # Try up to 10 times to prevent parallel push conflicts
+          for i in {1..10}; do
+            git fetch origin HEAD:${{ github.ref_name }}
+            git rebase origin/${{ github.ref_name }} || { git rebase --abort; git pull --rebase origin ${{ github.ref_name }}; }
             if git commit -m "Save chunk ${INDEX} checkpoint [skip ci]"; then
-              if git push origin HEAD:main; then
+              if git push origin HEAD:${{ github.ref_name }}; then
                 echo "Checkpoint committed and pushed successfully!"
                 break
               fi
@@ -185,9 +204,10 @@ jobs:
               echo "No changes to commit for chunk ${INDEX}."
               break
             fi
-            sleep $((RANDOM % 10 + 2))
+            sleep $((RANDOM % 15 + 5))
           done
 
+  # Job 3: Merge and compile results when done
   aggregate-results:
     needs: run-worker
     runs-on: ubuntu-latest
@@ -206,7 +226,7 @@ jobs:
           mkdir -p final-outputs
           find downloaded-chunks/ -name "results.txt" -exec cat {} + | sort -u > final-outputs/master_results.txt
           echo "=================================================="
-          echo "Consolidation complete!"
+          echo "Deduplication complete!"
           echo "Total unique URLs harvested: $(wc -l < final-outputs/master_results.txt)"
           echo "=================================================="
 
@@ -217,11 +237,11 @@ jobs:
           cp final-outputs/master_results.txt ./results.txt
           git add results.txt || true
           
-          for i in {1..8}; do
-            git fetch origin main
-            git rebase origin/main || { git rebase --abort; git pull --rebase origin main; }
+          for i in {1..10}; do
+            git fetch origin HEAD:${{ github.ref_name }}
+            git rebase origin/${{ github.ref_name }} || { git rebase --abort; git pull --rebase origin ${{ github.ref_name }}; }
             if git commit -m "Consolidate master results.txt [skip ci]"; then
-              if git push origin HEAD:main; then
+              if git push origin HEAD:${{ github.ref_name }}; then
                 echo "Master results updated successfully!"
                 break
               fi
@@ -229,7 +249,7 @@ jobs:
               echo "No new results to save."
               break
             fi
-            sleep $((RANDOM % 5 + 1))
+            sleep $((RANDOM % 10 + 2))
           done
 
       - name: Upload Master Results Artifact
