@@ -1,0 +1,239 @@
+name: Scale-Out Dork Matrix (20-Worker)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # Master Controller Host
+  master-dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Flask & Requests
+        run: pip install flask requests
+
+      - name: Install and Start Cloudflare Tunnel
+        run: |
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          # Expose local Flask Port 5000 (The Master UI)
+          cloudflared tunnel --url http://localhost:5000 > cloudflare_tunnel.log 2>&1 &
+          echo "Cloudflare Tunnel started for Master Dashboard."
+
+      - name: Launch Master Dashboard Server
+        run: |
+          # Start the master dashboard in background
+          python master_dashboard.py &
+          sleep 6
+          
+          # Grab the assigned public tunnel URL
+          TUNNEL_URL=$(grep -o 'https://[^ ]*\.trycloudflare\.com' cloudflare_tunnel.log | head -n 1)
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "Cloudflare Tunnel URL not found in log, printing log:"
+            cat cloudflare_tunnel.log
+            exit 1
+          fi
+          
+          echo "=================================================="
+          echo "MASTER CONTROLLER IS RUNNING!"
+          echo "OPEN THIS SINGLE URL ON YOUR PHONE OR PC:"
+          echo "$TUNNEL_URL"
+          echo "=================================================="
+          
+          # Commit the master URL to the repo so workers can find it
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          echo "$TUNNEL_URL" > master_url.txt
+          git add master_url.txt
+          git commit -m "Publish Master Control URL [skip ci]" || true
+          git push origin HEAD:main --force
+          
+          # Keep the dashboard running
+          wait -n
+
+  # 20 Parallel Worker runners that connect to Master
+  run-worker:
+    needs: master-dashboard
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Load Progress Checkpoint (If Exists)
+        run: |
+          INDEX=$(printf "%02d" ${{ matrix.chunk }})
+          if [ -d "progress/chunk_${INDEX}" ]; then
+            echo "Restoring state files for chunk ${INDEX}..."
+            cp -r progress/chunk_${INDEX}/* . || true
+          fi
+
+      - name: Split Dorks and Extract Chunk
+        run: |
+          python split_dorks.py
+          INDEX=$(printf "%02d" ${{ matrix.chunk }})
+          if [ -f "chunks/dorks_${INDEX}.txt" ]; then
+            mv "chunks/dorks_${INDEX}.txt" my_dorks.txt
+            echo "Loaded chunk ${INDEX} with $(wc -l < my_dorks.txt) dorks."
+          else
+            echo "No dorks file found for chunk ${INDEX}. Creating empty file."
+            touch my_dorks.txt
+          fi
+
+      - name: Write SearXNG Settings (Enable Google CSE)
+        run: |
+          mkdir -p searxng_config
+          cat << 'EOF' > settings.yml
+          use_default_settings: true
+          engines:
+            - name: google cse
+              engine: google_cse
+              shortcut: gcs
+              categories: general
+              timeout: 10.0
+              disabled: false
+          EOF
+
+      - name: Start SearXNG Container
+        run: |
+          docker run -d -p 8080:8080 -v $(pwd)/settings.yml:/etc/searxng/settings.yml --name searxng searxng/searxng
+          echo "Waiting for SearXNG to initialize..."
+          until $(curl --output /dev/null --silent --head --fail http://localhost:8080); do
+            printf '.'
+            sleep 2
+          done
+          echo "SearXNG is ready!"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 flask
+
+      - name: Start Cloudflare Tunnel for Worker
+        run: |
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          # Expose local Flask Port 5000 (The Worker UI)
+          cloudflared tunnel --url http://localhost:5000 > cloudflare_tunnel.log 2>&1 &
+          echo "Cloudflare Tunnel initiated for worker."
+
+      - name: Run Background Agent and Dork Worker
+        run: |
+          # Start the status reporter agent in the background
+          python worker_agent.py ${{ matrix.chunk }} ${{ github.repository }} &
+          
+          # Start your V11 dork worker (it starts on port 5000)
+          python dork_html_safe.py
+
+      - name: Save Chunk Progress to Workspace Folder
+        if: always()
+        run: |
+          INDEX=$(printf "%02d" ${{ matrix.chunk }})
+          mkdir -p "progress/chunk_${INDEX}"
+          cp results.txt "progress/chunk_${INDEX}/results.txt" || true
+          cp worker_state.json "progress/chunk_${INDEX}/worker_state.json" || true
+          cp worker_cache.json "progress/chunk_${INDEX}/worker_cache.json" || true
+
+      - name: Upload Results Chunk (Artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-chunk-${{ matrix.chunk }}
+          path: |
+            results.txt
+            worker_state.json
+            worker_cache.json
+          if-no-files-found: ignore
+
+      - name: Commit and Push Chunk Progress to Git
+        if: always()
+        run: |
+          INDEX=$(printf "%02d" ${{ matrix.chunk }})
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add "progress/chunk_${INDEX}/"
+          
+          # Multi-user Git collision avoidance retries
+          for i in {1..8}; do
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort; git pull --rebase origin main; }
+            if git commit -m "Save chunk ${INDEX} checkpoint [skip ci]"; then
+              if git push origin HEAD:main; then
+                echo "Checkpoint committed and pushed successfully!"
+                break
+              fi
+            else
+              echo "No changes to commit for chunk ${INDEX}."
+              break
+            fi
+            sleep $((RANDOM % 10 + 2))
+          done
+
+  aggregate-results:
+    needs: run-worker
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download All Results Chunks
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded-chunks/
+
+      - name: Merge and Deduplicate Results
+        run: |
+          mkdir -p final-outputs
+          find downloaded-chunks/ -name "results.txt" -exec cat {} + | sort -u > final-outputs/master_results.txt
+          echo "=================================================="
+          echo "Consolidation complete!"
+          echo "Total unique URLs harvested: $(wc -l < final-outputs/master_results.txt)"
+          echo "=================================================="
+
+      - name: Commit Master Results to Git Repo
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          cp final-outputs/master_results.txt ./results.txt
+          git add results.txt || true
+          
+          for i in {1..8}; do
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort; git pull --rebase origin main; }
+            if git commit -m "Consolidate master results.txt [skip ci]"; then
+              if git push origin HEAD:main; then
+                echo "Master results updated successfully!"
+                break
+              fi
+            else
+              echo "No new results to save."
+              break
+            fi
+            sleep $((RANDOM % 5 + 1))
+          done
+
+      - name: Upload Master Results Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: master-results
+          path: final-outputs/master_results.txt
