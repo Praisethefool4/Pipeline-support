@@ -1,4 +1,4 @@
-name: Scale-Out Dork Matrix
+name: Scale-Out Dork Matrix (19-Worker)
 
 on:
   workflow_dispatch:
@@ -7,14 +7,12 @@ permissions:
   contents: write
 
 jobs:
-  # Job 1: Run the central Master Dashboard
+  # Job 1: Persistent Central Master Controller Web UI
   master-dashboard:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -23,61 +21,50 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install flask requests
+          python -m pip install --upgrade pip
+          pip install requests flask
 
-      - name: Install and Start Cloudflare Tunnel
+      - name: Start Cloudflare Tunnel
         run: |
           curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
-          # Master dashboard runs on Port 5000
           cloudflared tunnel --url http://localhost:5000 > cloudflare_tunnel.log 2>&1 &
-          echo "Cloudflare Tunnel started."
+          echo "Cloudflare Tunnel successfully initiated."
 
-      - name: Wait for Tunnel and Publish URL
+      - name: Start Dashboard Server & Publish URL
         run: |
-          echo "Waiting for Cloudflare Tunnel to generate URL..."
-          sleep 10
-          MASTER_URL=""
-          for i in {1..15}; do
-            MASTER_URL=$(grep -o 'https://[^ ]*\.trycloudflare\.com' cloudflare_tunnel.log | head -n 1)
-            if [ ! -z "$MASTER_URL" ]; then
-              break
-            fi
-            sleep 2
-          done
-          
-          if [ -z "$MASTER_URL" ]; then
-            echo "Failed to get Cloudflare URL!"
+          python master_dashboard.py &
+          echo "Waiting for Cloudflare Tunnel to generate public link..."
+          sleep 12
+          URL=$(grep -o 'https://[^ ]*\.trycloudflare\.com' cloudflare_tunnel.log | head -n 1)
+          if [ -z "$URL" ]; then
+            echo "Error: Cloudflare Tunnel did not generate a URL. Printing log:"
             cat cloudflare_tunnel.log
             exit 1
           fi
+          echo "=================================================="
+          echo "MASTER DASHBOARD CONTROL URL:"
+          echo "$URL"
+          echo "=================================================="
+          echo "$URL" > master_url.txt
           
-          echo "MASTER URL IS: $MASTER_URL"
-          echo "$MASTER_URL" > master_url.txt
-          
-          # Publish URL to Git so workers can read it
+          # Commit the live URL so parallel workers can auto-discover it
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add master_url.txt
-          git commit -m "Publish Master Control URL [skip ci]" || true
-          git push origin HEAD:${{ github.ref_name }} --force || true
+          git commit -m "Publish Live Master URL [skip ci]" || true
+          git push origin HEAD:main --force || true
+          
+          # Wait to keep the dashboard active
+          wait -n
 
-      - name: Run Master Dashboard
-        run: |
-          echo "=================================================="
-          echo "MASTER DASHBOARD IS NOW ONLINE!"
-          echo "URL: $(cat master_url.txt)"
-          echo "=================================================="
-          python master_dashboard.py
-
-  # Job 2: Run 20 parallel workers
+  # Job 2: 19 Parallel Web Worker Nodes (No block, starts concurrently with Master)
   run-worker:
-    needs: master-dashboard
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        chunk: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        chunk: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
     steps:
       - name: Checkout Code
@@ -91,7 +78,7 @@ jobs:
             cp -r progress/chunk_${INDEX}/* . || true
           fi
 
-      - name: Split Dorks and Extract Chunk
+      - name: Segment Dork list
         run: |
           python split_dorks.py
           INDEX=$(printf "%02d" ${{ matrix.chunk }})
@@ -104,28 +91,30 @@ jobs:
             touch my_dorks.txt
           fi
 
-      - name: Configure SearXNG Settings
+      - name: Generate SearXNG Settings & Enable Google CSE
         run: |
-          # Create a basic settings.yml that enables google cse
           mkdir -p searxng_config
-          cat <<EOF > searxng_config/settings.yml
+          cat <<EOF > settings.yml
           use_default_settings: true
           engines:
             - name: google cse
               engine: google_cse
               shortcut: ggo
-              active: true
+              api_key: ""
+              cx: ""
+              timeout: 3.0
+              disabled: false
           EOF
 
-      - name: Start SearXNG Container
+      - name: Start SearXNG Node
         run: |
-          docker run -d -p 8080:8080 -v $(pwd)/searxng_config/settings.yml:/etc/searxng/settings.yml --name searxng searxng/searxng
+          docker run -d -p 8080:8080 -v $(pwd)/settings.yml:/etc/searxng/settings.yml --name searxng searxng/searxng
           echo "Waiting for SearXNG to be ready..."
           until $(curl --output /dev/null --silent --head --fail http://localhost:8080); do
             printf '.'
             sleep 2
           done
-          echo "SearXNG is ready!"
+          echo "SearXNG engine is healthy!"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -137,33 +126,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 flask
 
-      - name: Start Cloudflare Tunnel
+      - name: Start Local Worker Cloudflare Tunnel
         run: |
           curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
-          # Workers run dork_html_safe.py on port 5000
           cloudflared tunnel --url http://localhost:5000 > cloudflare_tunnel.log 2>&1 &
-          echo "Cloudflare Tunnel successfully initiated."
+          echo "Worker tunnel initiated."
 
-      - name: Run Web UI Worker & Telemetry Agent
+      - name: Run Web UI Worker and Tracking Agent
         run: |
-          # 1. Start the main V11 Python script in the background
+          # Start main Flask worker in background
           python dork_html_safe.py &
           
-          # 2. Start the telemetry agent in the background to report to Master
-          python worker_agent.py ${{ matrix.chunk }} ${{ github.repository }} ${{ github.ref_name }} &
+          # Start stats reporter agent in background
+          python worker_agent.py ${{ matrix.chunk }} ${{ github.repository }} &
           
-          # 3. Print the local worker URL for fallback manual access
-          sleep 8
-          echo "=================================================="
-          echo "WORKER JOB #${{ matrix.chunk }} LOCAL URL:"
-          grep -o 'https://[^ ]*\.trycloudflare\.com' cloudflare_tunnel.log || cat cloudflare_tunnel.log
-          echo "=================================================="
-          
-          # Keep runner alive as long as python script is running
+          # Keep runner alive
           wait -n
 
-      - name: Save Chunk Progress to Workspace Folder
+      - name: Save Chunk Progress to Repository Folder
         if: always()
         run: |
           INDEX=$(printf "%02d" ${{ matrix.chunk }})
@@ -172,7 +153,7 @@ jobs:
           cp worker_state.json "progress/chunk_${INDEX}/worker_state.json" || true
           cp worker_cache.json "progress/chunk_${INDEX}/worker_cache.json" || true
 
-      - name: Upload Results Chunk (Artifact)
+      - name: Upload Results Chunk (Artifact backup)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -183,7 +164,7 @@ jobs:
             worker_cache.json
           if-no-files-found: ignore
 
-      - name: Commit and Push Chunk Progress to Git
+      - name: Commit and Push Chunk Progress
         if: always()
         run: |
           INDEX=$(printf "%02d" ${{ matrix.chunk }})
@@ -191,23 +172,23 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add "progress/chunk_${INDEX}/"
           
-          # Try up to 10 times to prevent parallel push conflicts
-          for i in {1..10}; do
-            git fetch origin HEAD:${{ github.ref_name }}
-            git rebase origin/${{ github.ref_name }} || { git rebase --abort; git pull --rebase origin ${{ github.ref_name }}; }
+          # Auto-retry to avoid parallel push collisions
+          for i in {1..5}; do
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort; git pull --rebase origin main; }
             if git commit -m "Save chunk ${INDEX} checkpoint [skip ci]"; then
-              if git push origin HEAD:${{ github.ref_name }}; then
-                echo "Checkpoint committed and pushed successfully!"
+              if git push origin HEAD:main; then
+                echo "Checkpoint committed successfully!"
                 break
               fi
             else
               echo "No changes to commit for chunk ${INDEX}."
               break
             fi
-            sleep $((RANDOM % 15 + 5))
+            sleep $((RANDOM % 10 + 2))
           done
 
-  # Job 3: Merge and compile results when done
+  # Job 3: Compile and merge all lists when jobs complete
   aggregate-results:
     needs: run-worker
     runs-on: ubuntu-latest
@@ -230,18 +211,18 @@ jobs:
           echo "Total unique URLs harvested: $(wc -l < final-outputs/master_results.txt)"
           echo "=================================================="
 
-      - name: Commit Master Results to Git Repo
+      - name: Commit Master Results.txt to Repo
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           cp final-outputs/master_results.txt ./results.txt
           git add results.txt || true
           
-          for i in {1..10}; do
-            git fetch origin HEAD:${{ github.ref_name }}
-            git rebase origin/${{ github.ref_name }} || { git rebase --abort; git pull --rebase origin ${{ github.ref_name }}; }
+          for i in {1..5}; do
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort; git pull --rebase origin main; }
             if git commit -m "Consolidate master results.txt [skip ci]"; then
-              if git push origin HEAD:${{ github.ref_name }}; then
+              if git push origin HEAD:main; then
                 echo "Master results updated successfully!"
                 break
               fi
@@ -249,7 +230,7 @@ jobs:
               echo "No new results to save."
               break
             fi
-            sleep $((RANDOM % 10 + 2))
+            sleep $((RANDOM % 5 + 1))
           done
 
       - name: Upload Master Results Artifact
