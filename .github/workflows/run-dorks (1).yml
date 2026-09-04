@@ -1,0 +1,204 @@
+name: Scale-Out Orchestrated Dorking Matrix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # Job 1: Chunk the massive dork file into 50 files
+  split-dorks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Split Dorks
+        run: |
+          python split_dorks.py
+
+      - name: Upload Dork Chunks
+        uses: actions/upload-artifact@v4
+        with:
+          name: dork-chunks
+          path: chunks/
+
+  # Job 2: Launch the Master Controller Dashboard
+  master-dashboard:
+    needs: split-dorks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install flask requests
+
+      - name: Install Cloudflare Tunnel Client
+        run: |
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+
+      - name: Start Master Controller
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Start the master control Flask app in background
+          python master_dashboard.py &
+          
+          # Start cloudflared tunnel
+          cloudflared tunnel --url http://localhost:5000 > cloudflare_tunnel.log 2>&1 &
+          
+          echo "Waiting for Cloudflare Tunnel to generate public URL..."
+          sleep 12
+          
+          # Extract public URL
+          MASTER_URL=$(grep -o 'https://[^ ]*\.trycloudflare\.com' cloudflare_tunnel.log | head -n 1)
+          if [ -z "$MASTER_URL" ]; then
+            echo "Failed to generate Cloudflare URL"
+            cat cloudflare_tunnel.log
+            exit 1
+          fi
+          
+          echo "=================================================="
+          echo "MASTER CONTROLLER DASHBOARD IS READY!"
+          echo "CONTROL ALL 50 WORKERS LIVE AT THIS URL:"
+          echo "$MASTER_URL"
+          echo "=================================================="
+          
+          # Write master URL and publish to repository main branch
+          echo "$MASTER_URL" > master_url.txt
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add master_url.txt
+          git commit -m "Publish Master dashboard URL [skip ci]"
+          git push
+          
+          # Let the server run. It will shut down automatically when all workers finish.
+          wait -n
+
+  # Job 3: Scale-out 50 workers to harvest concurrently
+  run-worker:
+    needs: [split-dorks, master-dashboard]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Dork Chunks
+        uses: actions/download-artifact@v4
+        with:
+          name: dork-chunks
+          path: chunks/
+
+      - name: Setup Chunk file
+        run: |
+          INDEX=$(printf "%02d" ${{ matrix.chunk }})
+          mv chunks/dorks_${INDEX}.txt my_dorks.txt
+
+      - name: Configure and Start SearXNG
+        run: |
+          # Write the custom settings.yml on the fly (Enables google cse and /stats endpoint)
+          mkdir -p searxng-config
+          cat <<EOF > searxng-config/settings.yml
+          use_default_settings: true
+          server:
+            secret_key: "searxng_secret_key_for_dork_harvesting_automation"
+          engines:
+            - name: google cse
+              engine: google_cse
+              shortcut: gcse
+              disabled: false
+          EOF
+          
+          # Start SearXNG container mounting custom configuration
+          docker run -d -p 8080:8080 \
+            -v $(pwd)/searxng-config/settings.yml:/etc/searxng/settings.yml \
+            --name searxng searxng/searxng
+            
+          echo "Waiting for SearXNG container and engine list to load..."
+          until $(curl --output /dev/null --silent --head --fail http://localhost:8080); do sleep 2; done
+          echo "SearXNG is alive and google cse is enabled!"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install flask requests beautifulsoup4
+
+      - name: Install Cloudflare Tunnel Client
+        run: |
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+
+      - name: Start Cloudflare Tunnel and V11 Worker
+        run: |
+          # 1. Start cloudflared to expose local port 5000
+          cloudflared tunnel --url http://localhost:5000 > cloudflare_tunnel.log 2>&1 &
+          
+          # 2. Start dork_html_safe.py in background
+          python dork_html_safe.py &
+          
+          # 3. Start worker_agent.py to automatically handle master communication
+          python worker_agent.py ${{ matrix.chunk }} ${{ github.repository }} &
+          
+          # Wait for background processes to keep running
+          wait -n
+
+      - name: Upload Results Chunk Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-chunk-${{ matrix.chunk }}
+          path: |
+            results.txt
+            worker_state.json
+          if-no-files-found: ignore
+
+  # Job 4: Merge results from all finished/stopped workers into one master list
+  aggregate-results:
+    needs: [run-worker, master-dashboard]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download All Results Chunks
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded-chunks/
+
+      - name: Combine and Deduplicate
+        run: |
+          mkdir -p final-outputs
+          # Collect and merge any existing result chunk files into master_results.txt
+          find downloaded-chunks/ -name "results.txt" -exec cat {} + | sort -u > final-outputs/master_results.txt
+          echo "Compilation complete! Total unique URLs: "
+          wc -l final-outputs/master_results.txt
+
+      - name: Save Master Results to Repo
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          cp final-outputs/master_results.txt ./results.txt
+          # Delete master_url.txt to prepare for clean subsequent runs
+          rm -f master_url.txt || true
+          git add results.txt master_url.txt || true
+          if ! git diff --staged --quiet; then
+            git commit -m "Consolidated unified dork results from all matrix jobs [skip ci]"
+            git push
+          fi
