@@ -11,7 +11,7 @@ app = Flask(__name__)
 
 # Core state variables
 workers_lock = threading.Lock()
-workers_data = {}        # key: worker_id, value: { url, state, last_seen, total_dorks }
+workers_data = {}        # key: worker_id, value: { state, last_seen, total_dorks }
 pending_commands = {}    # key: worker_id, value: command_string
 
 # Live URL Feed state
@@ -34,115 +34,125 @@ HTML_DASHBOARD = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🛰️ Dorking Core Matrix - Tactical Operations Control</title>
+    <title>🛰️ OPERATOR CONSOLE - DORKING CORE MATRIX [V12]</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap');
         
         body {
-            background-color: #050811;
-            color: #f8fafc;
+            background-color: #03060f;
+            color: #d1f4ff;
             font-family: 'Share Tech Mono', monospace;
             padding-bottom: 60px;
             overflow-x: hidden;
+            background-image: radial-gradient(circle at 50% 50%, #081124 0%, #03060f 100%);
         }
         .navbar {
-            background-color: rgba(15, 23, 42, 0.95);
+            background-color: rgba(6, 11, 28, 0.95);
             border-bottom: 2px solid #00f3ff;
-            box-shadow: 0 0 15px rgba(0, 243, 255, 0.4);
+            box-shadow: 0 0 20px rgba(0, 243, 255, 0.5);
         }
         .navbar-brand {
-            font-size: 1.5rem;
-            letter-spacing: 2px;
+            font-size: 1.6rem;
+            letter-spacing: 3px;
             color: #00f3ff !important;
-            text-shadow: 0 0 10px rgba(0, 243, 255, 0.8);
+            text-shadow: 0 0 10px rgba(0, 243, 255, 0.8), 0 0 2px #00f3ff;
+            font-weight: bold;
         }
         .cyber-panel {
-            background-color: #0a0f1d;
-            border: 1px solid #1e293b;
+            background-color: rgba(8, 14, 30, 0.85);
+            border: 1px solid #00f3ff4d;
             border-radius: 8px;
-            box-shadow: inset 0 0 10px rgba(0,0,0,0.8);
+            box-shadow: inset 0 0 15px rgba(0, 243, 255, 0.1), 0 4px 10px rgba(0,0,0,0.5);
             position: relative;
         }
+        .cyber-panel::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0; height: 1px;
+            background: linear-gradient(90deg, transparent, #00f3ff, transparent);
+        }
         .cyber-header {
-            font-size: 1.1rem;
+            font-size: 1.15rem;
             color: #00f3ff;
             text-transform: uppercase;
-            letter-spacing: 1px;
-            border-bottom: 1px solid #1e293b;
+            letter-spacing: 2px;
+            border-bottom: 1px solid #00f3ff33;
             padding-bottom: 8px;
             margin-bottom: 15px;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            text-shadow: 0 0 8px rgba(0, 243, 255, 0.5);
         }
         .card {
-            background-color: #0a0f1d;
-            border: 1px solid #1e293b;
-            color: #f8fafc;
+            background-color: #050b18;
+            border: 1px solid #1e2e4a;
+            color: #e2f7ff;
             border-radius: 8px;
-            transition: all 0.3s ease;
+            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
         }
         .card:hover {
             border-color: #00f3ff;
-            box-shadow: 0 0 12px rgba(0, 243, 255, 0.3);
-            transform: translateY(-1px);
+            box-shadow: 0 0 15px rgba(0, 243, 255, 0.4);
+            transform: translateY(-2px);
         }
         .status-badge {
             font-size: 0.8rem;
-            padding: 4px 8px;
+            padding: 4px 10px;
             border-radius: 4px;
             font-weight: bold;
             letter-spacing: 1px;
+            box-shadow: 0 0 6px currentColor;
         }
         .status-running { 
-            background-color: rgba(0, 255, 102, 0.15); 
-            color: #00ff66; 
-            border: 1px solid #00ff66;
-            text-shadow: 0 0 8px rgba(0,255,102,0.5);
+            background-color: rgba(0, 255, 102, 0.12); 
+            color: #39ff14; 
+            border: 1px solid #39ff14;
             animation: pulse-green 1.5s infinite;
         }
         .status-paused { 
-            background-color: rgba(245, 158, 11, 0.15); 
+            background-color: rgba(245, 158, 11, 0.12); 
             color: #f59e0b; 
             border: 1px solid #f59e0b;
         }
         .status-quarantined { 
-            background-color: rgba(255, 0, 85, 0.2); 
-            color: #ff0055; 
-            border: 2px solid #ff0055;
-            text-shadow: 0 0 8px rgba(255,0,85,0.6);
+            background-color: rgba(255, 0, 110, 0.15); 
+            color: #ff006e; 
+            border: 2px solid #ff006e;
             animation: pulse-red 1s infinite;
+            font-size: 0.8rem;
         }
         .status-offline { 
-            background-color: rgba(71, 85, 105, 0.15); 
-            color: #94a3b8; 
+            background-color: rgba(148, 163, 184, 0.08); 
+            color: #64748b; 
             border: 1px solid #475569;
         }
         .status-completed { 
-            background-color: rgba(59, 130, 246, 0.15); 
+            background-color: rgba(59, 130, 246, 0.12); 
             color: #3b82f6; 
             border: 1px solid #3b82f6;
         }
         .stat-val {
-            font-size: 2.2rem;
+            font-size: 2.4rem;
             font-weight: bold;
             color: #ffffff;
-            text-shadow: 0 0 10px rgba(255,255,255,0.2);
+            line-height: 1;
         }
-        .stat-val-cyan { color: #00f3ff; text-shadow: 0 0 10px rgba(0,243,255,0.4); }
-        .stat-val-green { color: #00ff66; text-shadow: 0 0 10px rgba(0,255,102,0.4); }
-        .stat-val-red { color: #ff0055; text-shadow: 0 0 10px rgba(255,0,85,0.4); }
+        .stat-val-cyan { color: #00f3ff; text-shadow: 0 0 15px rgba(0,243,255,0.6); }
+        .stat-val-green { color: #39ff14; text-shadow: 0 0 15px rgba(57,255,20,0.6); }
+        .stat-val-red { color: #ff006e; text-shadow: 0 0 15px rgba(255,0,110,0.6); }
         
         .progress {
             height: 6px;
-            background-color: #0d1527;
-            border-radius: 3px;
-            border: 1px solid #1e293b;
+            background-color: #070d1a;
+            border-radius: 4px;
+            border: 1px solid #14243a;
+            overflow: hidden;
         }
         .progress-bar {
             background-color: #00f3ff;
-            box-shadow: 0 0 8px #00f3ff;
+            box-shadow: 0 0 10px #00f3ff;
         }
         .control-btn {
             border-radius: 4px;
@@ -151,56 +161,60 @@ HTML_DASHBOARD = """
             text-transform: uppercase;
             transition: all 0.2s;
         }
-        .btn-cyan {
-            background-color: rgba(0, 243, 255, 0.1);
-            color: #00f3ff;
-            border: 1px solid #00f3ff;
-        }
-        .btn-cyan:hover {
-            background-color: #00f3ff;
-            color: #050811;
-            box-shadow: 0 0 10px rgba(0, 243, 255, 0.5);
-        }
         .log-box {
-            background-color: #03050c;
-            color: #00ff66;
+            background-color: #02040a;
+            color: #39ff14;
             font-family: 'Share Tech Mono', monospace;
             font-size: 0.85rem;
-            height: 250px;
+            height: 280px;
             overflow-y: auto;
             border-radius: 4px;
             padding: 12px;
-            border: 1px solid #10b981;
-            box-shadow: inset 0 0 15px rgba(0,255,102,0.1);
+            border: 1px solid #39ff144d;
+            box-shadow: inset 0 0 15px rgba(57,255,20,0.05);
         }
         .url-box {
-            background-color: #03050c;
+            background-color: #02040a;
             color: #00f3ff;
             font-family: 'Share Tech Mono', monospace;
             font-size: 0.82rem;
-            height: 250px;
+            height: 280px;
             overflow-y: auto;
             border-radius: 4px;
             padding: 12px;
-            border: 1px solid #00f3ff;
-            box-shadow: inset 0 0 15px rgba(0,243,255,0.1);
+            border: 1px solid #00f3ff4d;
+            box-shadow: inset 0 0 15px rgba(0,243,255,0.05);
+        }
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #040914;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #1e3a5f;
+            border-radius: 3px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #00f3ff;
         }
         @keyframes pulse-green {
-            0% { box-shadow: 0 0 0 0 rgba(0, 255, 102, 0.4); }
-            70% { box-shadow: 0 0 0 8px rgba(0, 255, 102, 0); }
-            100% { box-shadow: 0 0 0 0 rgba(0, 255, 102, 0); }
+            0% { box-shadow: 0 0 0 0 rgba(57, 255, 20, 0.4); }
+            70% { box-shadow: 0 0 0 8px rgba(57, 255, 20, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(57, 255, 20, 0); }
         }
         @keyframes pulse-red {
-            0% { box-shadow: 0 0 0 0 rgba(255, 0, 85, 0.6); }
-            70% { box-shadow: 0 0 0 10px rgba(255, 0, 85, 0); }
-            100% { box-shadow: 0 0 0 0 rgba(255, 0, 85, 0); }
+            0% { box-shadow: 0 0 0 0 rgba(255, 0, 110, 0.6); }
+            70% { box-shadow: 0 0 0 10px rgba(255, 0, 110, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(255, 0, 110, 0); }
         }
     </style>
 </head>
 <body>
     <nav class="navbar navbar-dark sticky-top mb-4">
         <div class="container-fluid">
-            <span class="navbar-brand mb-0 h1">🛰️ DORKING MATRIX CORE CONTROL [V12]</span>
+            <span class="navbar-brand mb-0 h1">🛰️ OPERATOR CONSOLE - DORKING CORE MATRIX [V12]</span>
             <div class="d-flex">
                 <button onclick="globalAction('start')" class="btn btn-sm btn-outline-success me-2 control-btn">▶ Broadcast Start</button>
                 <button onclick="globalAction('pause')" class="btn btn-sm btn-outline-warning me-2 control-btn">⏸ Broadcast Pause</button>
@@ -210,30 +224,30 @@ HTML_DASHBOARD = """
     </nav>
 
     <div class="container-fluid px-4">
-        <!-- Dashboard Live Status Summary -->
+        <!-- Stats Row -->
         <div class="row g-3 mb-4">
             <div class="col-md-3">
                 <div class="cyber-panel p-3 text-center">
-                    <div class="text-muted text-uppercase mb-1 small">Online Workers</div>
+                    <div class="text-muted text-uppercase mb-1 small" style="letter-spacing:1px;">Online Workers</div>
                     <div id="stat-active-workers" class="stat-val stat-val-cyan">0 / 19</div>
                 </div>
             </div>
             <div class="col-md-3">
                 <div class="cyber-panel p-3 text-center">
-                    <div class="text-muted text-uppercase mb-1 small">URLs Harvested (Clean)</div>
+                    <div class="text-muted text-uppercase mb-1 small" style="letter-spacing:1px;">URLs Harvested (Clean)</div>
                     <div id="stat-total-urls" class="stat-val stat-val-green">0</div>
                 </div>
             </div>
             <div class="col-md-3">
                 <div class="cyber-panel p-3 text-center">
-                    <div class="text-muted text-uppercase mb-1 small">Quarantined Nodes (429 / Ban)</div>
+                    <div class="text-muted text-uppercase mb-1 small" style="letter-spacing:1px;">Quarantined Nodes (429/Bans)</div>
                     <div id="stat-quarantined" class="stat-val stat-val-red">0</div>
                 </div>
             </div>
             <div class="col-md-3">
                 <div class="cyber-panel p-3 text-center">
-                    <div class="text-muted text-uppercase mb-1 small">GitHub Release Asset</div>
-                    <div id="stat-release-published" class="stat-val" style="font-size: 1.1rem; padding-top: 10px; color:#a5f3fc;">
+                    <div class="text-muted text-uppercase mb-1 small" style="letter-spacing:1px;">GitHub Live Release Sync</div>
+                    <div id="stat-release-published" class="stat-val" style="font-size: 1.05rem; padding-top: 6px; color:#a5f3fc; line-height: 1.4;">
                         Published: <span id="stat-release-count" class="fw-bold">0</span> times<br>
                         <span class="small text-muted" id="stat-release-time">Syncing...</span>
                     </div>
@@ -242,7 +256,7 @@ HTML_DASHBOARD = """
         </div>
 
         <div class="row g-3 mb-4">
-            <!-- Left Console: System Logs -->
+            <!-- Left Console: Logs -->
             <div class="col-lg-6">
                 <div class="cyber-panel p-3">
                     <div class="cyber-header">🛡️ Live Security & Orchestrator Logs</div>
@@ -252,7 +266,7 @@ HTML_DASHBOARD = """
                 </div>
             </div>
             
-            <!-- Right Console: Live URL Stream -->
+            <!-- Right Console: URLs -->
             <div class="col-lg-6">
                 <div class="cyber-panel p-3">
                     <div class="cyber-header">⚡ Live Unique URL Harvesting Stream</div>
@@ -315,45 +329,45 @@ HTML_DASHBOARD = """
                             statusClass = 'status-paused';
                         } else if (wStatus === 'QUARANTINED') {
                             statusClass = 'status-quarantined';
-                            cardBorder = 'border: 2px solid #ff0055;';
+                            cardBorder = 'border: 1px solid #ff006e; box-shadow: 0 0 10px rgba(255, 0, 110, 0.3);';
                         } else if (wStatus === 'FINISHED') {
                             statusClass = 'status-completed';
                         }
                     }
                     
                     if (wStatus === 'QUARANTINED') {
-                        actionButtonHtml = `<button onclick="controlWorker(${i}, 'release')" class="btn btn-sm btn-outline-success w-100 fw-bold">⚠️ Release node</button>`;
+                        actionButtonHtml = `<button onclick="controlWorker(${i}, 'release')" class="btn btn-sm btn-outline-success w-100 fw-bold control-btn">⚠️ Release node</button>`;
                     } else if (worker.is_online) {
                         actionButtonHtml = `
                             <div class="d-flex gap-1 w-100">
-                                <button onclick="controlWorker(${i}, 'start')" class="btn btn-sm btn-outline-success flex-fill">▶</button>
-                                <button onclick="controlWorker(${i}, 'pause')" class="btn btn-sm btn-outline-warning flex-fill">⏸</button>
-                                <button onclick="controlWorker(${i}, 'quarantine')" class="btn btn-sm btn-outline-danger flex-fill">⚠️ Quarantine</button>
+                                <button onclick="controlWorker(${i}, 'start')" class="btn btn-sm btn-outline-success flex-fill control-btn">▶</button>
+                                <button onclick="controlWorker(${i}, 'pause')" class="btn btn-sm btn-outline-warning flex-fill control-btn">⏸</button>
+                                <button onclick="controlWorker(${i}, 'quarantine')" class="btn btn-sm btn-outline-danger flex-fill control-btn">⚠️ Quarantine</button>
                             </div>
                         `;
                     } else {
-                        actionButtonHtml = `<button class="btn btn-sm btn-outline-secondary w-100" disabled>Inactive VM</button>`;
+                        actionButtonHtml = `<button class="btn btn-sm btn-outline-secondary w-100" style="color:#5e728c; border-color:#2a3e5c;" disabled>Inactive VM</button>`;
                     }
                     
                     const cardHtml = `
                         <div class="col">
                             <div class="card p-3" style="${cardBorder}">
                                 <div class="d-flex justify-content-between align-items-center mb-2">
-                                    <h5 class="m-0 text-white">Worker Node #${i}</h5>
+                                    <h5 class="m-0 text-white" style="font-size: 0.95rem; font-weight:bold; letter-spacing:1px;">Worker Node #${i}</h5>
                                     <span class="status-badge ${statusClass}">${wStatus}</span>
                                 </div>
                                 <div class="mb-2">
-                                    <small class="text-muted d-block uppercase" style="font-size:0.75rem;">Active Target Dork</small>
-                                    <div class="text-truncate fw-bold" style="max-width: 100%; color: #00f3ff; font-size:0.85rem;" title="${lastQuery}">${lastQuery}</div>
+                                    <small class="text-muted d-block text-uppercase" style="font-size:0.7rem; letter-spacing: 0.5px;">Active Target Dork</small>
+                                    <div class="text-truncate fw-bold" style="max-width: 100%; color: #00f3ff; font-size:0.8rem;" title="${lastQuery}">${lastQuery}</div>
                                 </div>
                                 <div class="row mb-2">
                                     <div class="col-6">
-                                        <small class="text-muted d-block" style="font-size:0.75rem;">URLs Harvested</small>
-                                        <span class="fw-bold text-success" style="font-size:1.1rem;">${harvested}</span>
+                                        <small class="text-muted d-block text-uppercase" style="font-size:0.7rem; letter-spacing: 0.5px;">Harvested URLs</small>
+                                        <span class="fw-bold text-success" style="font-size:1.05rem;">${harvested}</span>
                                     </div>
                                     <div class="col-6 text-end">
-                                        <small class="text-muted d-block" style="font-size:0.75rem;">Progress</small>
-                                        <span class="fw-bold text-white">${dorkIndex} / ${totalDorks}</span>
+                                        <small class="text-muted d-block text-uppercase" style="font-size:0.7rem; letter-spacing: 0.5px;">Progress</small>
+                                        <span class="fw-bold text-white" style="font-size:0.95rem;">${dorkIndex} / ${totalDorks}</span>
                                     </div>
                                 </div>
                                 <div class="progress mb-3">
@@ -494,8 +508,8 @@ def submit_urls():
     with live_urls_lock:
         for u in urls:
             live_urls_feed.append({"worker_id": worker_id, "url": u, "time": t_str})
-        # Keep only the last 100 entries to prevent memory swelling
-        del live_urls_feed[:-100]
+        # Keep only the last 150 entries to prevent memory swelling
+        del live_urls_feed[:-150]
         
     return jsonify({"ok": True})
 
@@ -508,8 +522,8 @@ def status_api():
     
     with workers_lock:
         for w_id, w_info in workers_data.items():
-            # Check online state (online if active ping in last 20 seconds)
-            is_online = (now - w_info["last_seen"]) < 20
+            # Check online state (online if active ping in last 25 seconds)
+            is_online = (now - w_info["last_seen"]) < 25
             w_info["is_online"] = is_online
             
             w_state = w_info["state"] or {}

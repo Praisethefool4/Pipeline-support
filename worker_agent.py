@@ -6,18 +6,17 @@ import re
 from pathlib import Path
 import requests
 
-def fetch_master_url(repo_full_name):
-    """Fetches the Master dashboard URL from GitHub Raw files to avoid git-pull lag."""
+def fetch_master_urls(repo_full_name):
+    """Fetches the list of Master dashboard URLs from GitHub Raw main branch."""
     url = f"https://raw.githubusercontent.com/{repo_full_name}/main/master_url.txt"
     try:
         r = requests.get(url, timeout=10)
         if r.status_code == 200:
-            m_url = r.text.strip()
-            if m_url.startswith("https://"):
-                return m_url
+            urls = [line.strip() for line in r.text.splitlines() if line.strip().startswith("https://")]
+            return urls
     except Exception as e:
-        print(f"[Agent] Error fetching master URL: {e}")
-    return None
+        print(f"[Agent] Error fetching master URLs: {e}")
+    return []
 
 def get_total_dorks():
     """Reads my_dorks.txt to find how many dorks this worker has."""
@@ -40,42 +39,42 @@ def load_worker_state():
     except Exception:
         return {}
 
-def stream_new_urls(master_url, worker_id, offset_file):
-    """Streams new unique URLs to the master using file position offset tracking."""
+def submit_new_urls(master_url, worker_id):
+    """Reads new URLs harvested locally and pushes them to the Master Dashboard live."""
     results_file = Path("results.txt")
     if not results_file.exists():
         return
-        
-    pos = 0
-    if offset_file.exists():
+    
+    pos_file = Path("last_read_pos.txt")
+    last_pos = 0
+    if pos_file.exists():
         try:
-            pos = int(offset_file.read_text().strip())
+            last_pos = int(pos_file.read_text().strip())
         except Exception:
             pass
             
-    file_size = results_file.stat().st_size
-    if file_size < pos:
-        pos = 0  # File was wiped or truncated, restart
-        
-    if file_size > pos:
+    current_size = results_file.stat().st_size
+    if current_size > last_pos:
         try:
             with results_file.open("r", encoding="utf-8", errors="ignore") as f:
-                f.seek(pos)
-                new_urls = [line.strip() for line in f if line.strip().startswith(("http://", "https://"))]
-                new_pos = f.tell()
+                f.seek(last_pos)
+                new_lines = [line.strip() for line in f if line.strip().startswith(("http://", "https://"))]
                 
-            if new_urls:
-                print(f"[Agent] Found {len(new_urls)} new URLs. Streaming to Master...")
-                r = requests.post(
-                    f"{master_url}/submit_urls",
-                    json={"id": worker_id, "urls": new_urls},
-                    timeout=10
-                )
-                if r.status_code == 200:
-                    offset_file.write_text(str(new_pos))
-                    print(f"[Agent] Successfully streamed {len(new_urls)} URLs.")
+            if new_lines:
+                # Deduplicate batch
+                new_lines = list(dict.fromkeys(new_lines))
+                # Send in batches of 100 to avoid payload bloating
+                batch_size = 100
+                for i in range(0, len(new_lines), batch_size):
+                    batch = new_lines[i:i+batch_size]
+                    requests.post(
+                        f"{master_url}/submit_urls",
+                        json={"id": worker_id, "urls": batch},
+                        timeout=8
+                    )
+            pos_file.write_text(str(current_size))
         except Exception as e:
-            print(f"[Agent] URL streaming failed: {e}")
+            print(f"[Agent] URL submission to {master_url} failed: {e}")
 
 def main():
     if len(sys.argv) < 3:
@@ -87,50 +86,58 @@ def main():
     
     print(f"[Agent] Worker Agent started for Worker #{worker_id}")
     
-    # 1. Wait for Master URL to be available in the repository
-    master_url = None
+    # 1. Wait for Master URLs to be available in the repository
+    master_urls = []
     print("[Agent] Querying GitHub for master_url.txt...")
-    while not master_url:
-        master_url = fetch_master_url(repo_name)
-        if master_url:
-            print(f"[Agent] Successfully discovered Master URL: {master_url}")
+    while not master_urls:
+        master_urls = fetch_master_urls(repo_name)
+        if master_urls:
+            print(f"[Agent] Successfully discovered Master URLs: {master_urls}")
             break
-        print("[Agent] Master URL not ready yet in Git. Waiting...")
+        print("[Agent] Master URLs not ready yet in Git. Waiting...")
         time.sleep(5)
         
-    # 2. Register with Master
-    total_dorks = get_total_dorks()
+    # 2. Register with the Master Dashboard (Try Cloudflare first, then Localtunnel)
     registered = False
-    while not registered:
-        try:
-            r = requests.post(
-                f"{master_url}/register",
-                json={"id": worker_id, "total_dorks": total_dorks},
-                timeout=10
-            )
-            if r.status_code == 200:
-                print("[Agent] Registered successfully with Master dashboard!")
-                registered = True
-            else:
-                print(f"[Agent] Failed to register: Status {r.status_code}. Retrying...")
-        except Exception as e:
-            print(f"[Agent] Connection to master failed: {e}. Retrying...")
-        time.sleep(5)
-        
-    # 3. Enter real-time telemetry streaming and command pulling loop
-    print("[Agent] Entering telemetry update loop.")
-    offset_file = Path(".agent_offset.txt")
+    active_master_url = None
+    total_dorks = get_total_dorks()
     
-    while True:
-        # Step A: Stream any newly found URLs to Master
-        stream_new_urls(master_url, worker_id, offset_file)
-        
-        # Step B: Load current local state and push as heartbeat to Master
-        state = load_worker_state()
-        if state:
+    while not registered:
+        for m_url in master_urls:
             try:
+                print(f"[Agent] Attempting registration at master: {m_url}")
                 r = requests.post(
-                    f"{master_url}/update",
+                    f"{m_url}/register",
+                    json={"id": worker_id, "total_dorks": total_dorks},
+                    timeout=10
+                )
+                if r.status_code == 200:
+                    print(f"[Agent] Registered successfully with Master: {m_url}!")
+                    registered = True
+                    active_master_url = m_url
+                    break
+            except Exception as e:
+                print(f"[Agent] Connection to master {m_url} failed: {e}")
+        if not registered:
+            print("[Agent] All registration attempts failed. Retrying in 5s...")
+            time.sleep(5)
+            # Re-fetch in case master restarted with new links
+            new_urls = fetch_master_urls(repo_name)
+            if new_urls:
+                master_urls = new_urls
+                
+    # 3. Periodically stream stats & new URLs, and poll for commands from active Master
+    print(f"[Agent] Entering active status and URL update loop against: {active_master_url}")
+    while True:
+        try:
+            # First, submit any newly scraped URLs
+            submit_new_urls(active_master_url, worker_id)
+            
+            # Next, load state and send update to master
+            state = load_worker_state()
+            if state:
+                r = requests.post(
+                    f"{active_master_url}/update",
                     json={"id": worker_id, "state": state},
                     timeout=5
                 )
@@ -138,18 +145,21 @@ def main():
                     res_data = r.json()
                     cmd = res_data.get("command")
                     if cmd:
-                        print(f"[Agent] Received command from Master: {cmd}")
-                        # Route command to local Flask worker app running on port 5000
+                        print(f"[Agent] Received control directive from Master: {cmd}")
                         try:
-                            # Map 'release' command to local 'start' API to resume crawling
-                            local_action = "start" if cmd in ("start", "release") else cmd
-                            res = requests.post(f"http://localhost:5000/{local_action}", json={}, timeout=5)
-                            print(f"[Agent] Forwarded local /{local_action} endpoint: {res.status_code}")
-                        except Exception as lex:
-                            print(f"[Agent] Local worker command delivery failed: {lex}")
-            except Exception as e:
-                print(f"[Agent] Heartbeat update to Master failed: {e}")
-                
+                            # Forward command to the local flask worker running on port 5000
+                            # Map special actions
+                            local_cmd = cmd
+                            if cmd == "quarantine":
+                                local_cmd = "pause"
+                            elif cmd == "release":
+                                local_cmd = "start"
+                            requests.post(f"http://localhost:5000/{local_cmd}", json={}, timeout=5)
+                        except Exception as ex:
+                            print(f"[Agent] Failed to forward directive to local worker: {ex}")
+        except Exception as e:
+            print(f"[Agent] Heartbeat communication failed: {e}")
+            
         time.sleep(5)
 
 if __name__ == "__main__":
