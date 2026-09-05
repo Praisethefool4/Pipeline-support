@@ -4,13 +4,13 @@ import threading
 import time
 import os
 from pathlib import Path
-import requests
 
 app = Flask(__name__)
 
 # State storage for all registered workers
 workers_lock = threading.Lock()
-workers_data = {}  # key: worker_id, value: { state, last_seen, pending_command }
+workers_data = {}        # key: worker_id, value: { url, state, last_seen, total_dorks }
+pending_commands = {}    # key: worker_id, value: list of commands
 
 # Path to store final master results
 RESULTS_FILE = Path("results.txt")
@@ -21,7 +21,7 @@ HTML_DASHBOARD = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Global Dorking Orchestrator (19-Worker Matrix)</title>
+    <title>Global Dorking Orchestrator</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
     <style>
         body {
@@ -53,19 +53,17 @@ HTML_DASHBOARD = """
         }
         .status-running { background-color: #16a34a; color: white; }
         .status-paused { background-color: #d97706; color: white; }
-        .status-stopped { background-color: #dc2626; color: white; }
-        .status-offline { background-color: #475569; color: white; }
+        .status-blocked { background-color: #dc2626; color: white; animation: pulse 1.5s infinite; }
+        .status-stopped { background-color: #475569; color: white; }
+        .status-offline { background-color: #334155; color: #94a3b8; }
         .status-completed { background-color: #2563eb; color: white; }
-        .status-blocked { 
-            background-color: #ef4444; 
-            color: white;
-            animation: pulse-red 1.5s infinite;
+        
+        @keyframes pulse {
+            0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.7); }
+            70% { transform: scale(1.03); box-shadow: 0 0 0 10px rgba(220, 38, 38, 0); }
+            100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(220, 38, 38, 0); }
         }
-        @keyframes pulse-red {
-            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
-            70% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
-            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
-        }
+        
         .progress {
             height: 8px;
             background-color: #334155;
@@ -89,15 +87,12 @@ HTML_DASHBOARD = """
             padding: 12px;
             border: 1px solid #1e293b;
         }
-        .text-error {
-            color: #f87171 !important;
-        }
     </style>
 </head>
 <body>
     <nav class="navbar navbar-dark sticky-top mb-4">
         <div class="container-fluid">
-            <span class="navbar-brand mb-0 h1">🚀 Global Dorking Controller (19-Worker Setup)</span>
+            <span class="navbar-brand mb-0 h1">🚀 Global Dorking Controller</span>
             <div class="d-flex">
                 <button onclick="globalAction('start')" class="btn btn-success me-2 control-btn">▶ Start All</button>
                 <button onclick="globalAction('pause')" class="btn btn-warning me-2 control-btn">⏸ Pause All</button>
@@ -109,27 +104,27 @@ HTML_DASHBOARD = """
     <div class="container-fluid px-4">
         <!-- Stats Row -->
         <div class="row g-3 mb-4">
-            <div class="col-md-3">
+            <div class="col-6 col-md-3">
                 <div class="card p-3 text-center">
-                    <h6 class="text-muted text-uppercase small font-weight-bold">Total Active Workers</h6>
+                    <h6 class="text-muted">Active Workers</h6>
                     <h2 id="stat-active-workers">0 / 19</h2>
                 </div>
             </div>
-            <div class="col-md-3">
+            <div class="col-6 col-md-3">
                 <div class="card p-3 text-center">
-                    <h6 class="text-muted text-uppercase small font-weight-bold">Total Harvested URLs</h6>
+                    <h6 class="text-muted">Total Harvested URLs</h6>
                     <h2 id="stat-total-urls" class="text-success">0</h2>
                 </div>
             </div>
-            <div class="col-md-3">
+            <div class="col-6 col-md-3">
                 <div class="card p-3 text-center">
-                    <h6 class="text-muted text-uppercase small font-weight-bold">Google Blocked Count</h6>
+                    <h6 class="text-muted">Google Blocked Count</h6>
                     <h2 id="stat-blocked-count" class="text-danger">0</h2>
                 </div>
             </div>
-            <div class="col-md-3">
+            <div class="col-6 col-md-3">
                 <div class="card p-3 text-center">
-                    <h6 class="text-muted text-uppercase small font-weight-bold">Master Tunnel Status</h6>
+                    <h6 class="text-muted">Master Status</h6>
                     <h2 id="stat-master-status" class="text-info">ACTIVE</h2>
                 </div>
             </div>
@@ -137,7 +132,7 @@ HTML_DASHBOARD = """
 
         <!-- Workers Grid -->
         <h4 class="mb-3">Worker Matrix Nodes</h4>
-        <div class="row row-cols-1 row-cols-md-2 row-cols-lg-3 row-cols-xl-4 g-3" id="workers-grid">
+        <div class="row row-cols-1 row-cols-sm-2 row-cols-md-3 row-cols-lg-4 g-3" id="workers-grid">
             <!-- Dynamic Injection -->
         </div>
 
@@ -145,12 +140,14 @@ HTML_DASHBOARD = """
         <h4 class="mt-5 mb-3">Live Consolidated Activity Logs</h4>
         <div class="card p-3">
             <div class="log-box" id="activity-logs">
-                [System Log] Dashboard initialized and listening for worker connections...
+                [System Log] Dashboard initialized. Waiting for 19 workers to register and stream statistics...
             </div>
         </div>
     </div>
 
     <script>
+        let lastLogs = [];
+
         async function fetchState() {
             try {
                 const res = await fetch('/status_api');
@@ -159,64 +156,49 @@ HTML_DASHBOARD = """
                 // Update Global Stats
                 document.getElementById('stat-active-workers').innerText = `${data.active_count} / 19`;
                 document.getElementById('stat-total-urls').innerText = data.total_master_urls;
+                document.getElementById('stat-blocked-count').innerText = data.blocked_count;
                 
                 // Render Workers
                 const grid = document.getElementById('workers-grid');
                 grid.innerHTML = '';
                 
-                let logs = [];
-                let blockedCount = 0;
+                let incomingLogs = [];
                 
-                Object.keys(data.workers).sort((a,b) => parseInt(a) - parseInt(b)).forEach(id => {
-                    const worker = data.workers[id];
+                // Ensure all 19 indices exist
+                for (let i = 1; i <= 19; i++) {
+                    const idStr = i.toString();
+                    const worker = data.workers[idStr] || { is_online: false, total_dorks: 0, state: {} };
                     const wState = worker.state || {};
                     const lastQuery = wState.last_query || 'None';
                     const harvested = wState.urls || 0;
                     const dorkIndex = wState.index || 0;
-                    const totalDorks = worker.total_dorks || 1000;
-                    const pct = totalDorks > 0 ? Math.round((dorkIndex / totalDorks) * 100) : 0;
-                    const lastError = wState.last_error || '';
+                    const totalDorks = worker.total_dorks || 0;
+                    const pct = totalDorks > 0 ? Math.min(100, Math.round((dorkIndex / totalDorks) * 100)) : 0;
                     
                     let statusClass = 'status-offline';
-                    let wStatus = worker.is_online ? (wState.status || 'PAUSED') : 'OFFLINE';
+                    let wStatus = 'OFFLINE';
                     
-                    // Detect Google block/429/suspended
-                    const isBlocked = wStatus.includes('BLOCKED') || 
-                                      wStatus.includes('SUSPENDED') || 
-                                      lastError.toLowerCase().includes('429') || 
-                                      lastError.toLowerCase().includes('suspended') || 
-                                      lastError.toLowerCase().includes('captcha');
-                                      
-                    if (isBlocked && worker.is_online) {
-                        wStatus = 'BLOCKED (429)';
-                        statusClass = 'status-blocked';
-                        blockedCount++;
-                    } else if (wStatus === 'RUNNING') {
-                        statusClass = 'status-running';
-                    } else if (wStatus === 'AUTO-PAUSED' || wStatus === 'PAUSED') {
-                        statusClass = 'status-paused';
-                    } else if (wStatus === 'STOPPED') {
-                        statusClass = 'status-stopped';
-                    } else if (wStatus === 'FINISHED') {
-                        statusClass = 'status-completed';
+                    if (worker.is_online) {
+                        wStatus = wState.status || 'PAUSED';
+                        if (wStatus === 'RUNNING') statusClass = 'status-running';
+                        else if (wStatus.includes('PAUSE')) statusClass = 'status-paused';
+                        else if (wStatus.includes('SUSPENDED') || wStatus.includes('BLOCKED') || wStatus.includes('429')) {
+                            statusClass = 'status-blocked';
+                        }
+                        else if (wStatus === 'STOPPED') statusClass = 'status-stopped';
+                        else if (wStatus === 'FINISHED') statusClass = 'status-completed';
                     }
-                    
-                    const errorBlock = lastError ? `<div class="text-error small text-truncate mt-1">⚠️ ${lastError}</div>` : '';
-                    const pendingCmd = worker.pending_command && worker.pending_command !== 'idle' ? 
-                                       `<small class="text-info d-block mt-1">🕒 Sending: ${worker.pending_command.toUpperCase()}...</small>` : '';
                     
                     const cardHtml = `
                         <div class="col">
                             <div class="card p-3 ${statusClass === 'status-blocked' ? 'border-danger' : ''}">
                                 <div class="d-flex justify-content-between align-items-center mb-2">
-                                    <h5 class="m-0">Worker #${id}</h5>
+                                    <h5 class="m-0">Worker #${i}</h5>
                                     <span class="status-badge ${statusClass}">${wStatus}</span>
                                 </div>
                                 <div class="mb-2">
                                     <small class="text-muted">Current Query:</small>
-                                    <div class="text-truncate fw-bold" style="max-width: 100%; color: #38bdf8;">${lastQuery}</div>
-                                    ${errorBlock}
-                                    ${pendingCmd}
+                                    <div class="text-truncate fw-bold" style="max-width: 100%; color: #38bdf8;" title="${lastQuery}">${lastQuery}</div>
                                 </div>
                                 <div class="row mb-2">
                                     <div class="col-6">
@@ -225,17 +207,17 @@ HTML_DASHBOARD = """
                                     </div>
                                     <div class="col-6 text-end">
                                         <small class="text-muted d-block">Progress</small>
-                                        <span class="fw-bold">${dorkIndex} / ${totalDorks}</span>
+                                        <span class="fw-bold text-info">${dorkIndex} / ${totalDorks}</span>
                                     </div>
                                 </div>
                                 <div class="progress mb-3">
                                     <div class="progress-bar" role="progressbar" style="width: ${pct}%" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100"></div>
                                 </div>
                                 <div class="d-flex justify-content-end">
-                                    <div>
-                                        <button onclick="controlWorker(${id}, 'start')" class="btn btn-sm btn-success me-1" title="Start/Resume">▶</button>
-                                        <button onclick="controlWorker(${id}, 'pause')" class="btn btn-sm btn-warning me-1" title="Pause">⏸</button>
-                                        <button onclick="controlWorker(${id}, 'stop')" class="btn btn-sm btn-danger" title="Stop">⏹</button>
+                                    <div class="btn-group w-100">
+                                        <button onclick="controlWorker(${i}, 'start')" class="btn btn-sm btn-success">▶ Start</button>
+                                        <button onclick="controlWorker(${i}, 'pause')" class="btn btn-sm btn-warning">⏸ Pause</button>
+                                        <button onclick="controlWorker(${i}, 'stop')" class="btn btn-sm btn-danger">⏹ Stop</button>
                                     </div>
                                 </div>
                             </div>
@@ -243,19 +225,23 @@ HTML_DASHBOARD = """
                     `;
                     grid.innerHTML += cardHtml;
                     
-                    // Aggregate logs
+                    // Pull logs
                     if (wState.logs && wState.logs.length > 0) {
                         wState.logs.slice(-3).forEach(l => {
-                            logs.push(`[Worker #${id}] [${l.time}] Q:${l.query} P:${l.page} -> Found: ${l.urls} [${l.status}]`);
+                            incomingLogs.push({
+                                time: l.time || '00:00:00',
+                                msg: `[Worker #${i}] Q:${l.query || 'N/A'} (Page ${l.page || 1}) -> Found: ${l.urls || 0} [${l.status || 'OK'}]`
+                            });
                         });
                     }
-                });
+                }
                 
-                document.getElementById('stat-blocked-count').innerText = blockedCount;
-                
-                if (logs.length > 0) {
+                // Show aggregated logs
+                if (incomingLogs.length > 0) {
+                    // Sort logs by time
+                    incomingLogs.sort((a, b) => b.time.localeCompare(a.time));
                     const logContainer = document.getElementById('activity-logs');
-                    logContainer.innerHTML = logs.reverse().slice(0, 100).join('<br>');
+                    logContainer.innerHTML = incomingLogs.slice(0, 100).map(l => `[${l.time}] ${l.msg}`).join('<br>');
                 }
                 
             } catch (err) {
@@ -264,13 +250,13 @@ HTML_DASHBOARD = """
         }
 
         async function globalAction(action) {
-            if (!confirm(`Are you sure you want to trigger "${action.toUpperCase()}" on all 19 workers?`)) return;
             try {
-                await fetch(`/global_control?action=${action}`, { method: 'POST' });
-                alert(`Broadcasted ${action.toUpperCase()} command to all active workers!`);
+                const res = await fetch(`/global_control?action=${action}`, { method: 'POST' });
+                const data = await res.json();
+                console.log(`Global ${action}:`, data);
                 fetchState();
             } catch (err) {
-                alert("Failed to send global command.");
+                console.error("Failed to send global command:", err);
             }
         }
 
@@ -278,13 +264,10 @@ HTML_DASHBOARD = """
             try {
                 const res = await fetch(`/control_worker?id=${id}&action=${action}`, { method: 'POST' });
                 const data = await res.json();
-                if (data.ok) {
-                    fetchState();
-                } else {
-                    alert(`Error: ${data.error}`);
-                }
+                console.log(`Worker #${id} command:`, data);
+                fetchState();
             } catch (err) {
-                alert("Failed to communicate with worker.");
+                console.error("Failed to send worker command:", err);
             }
         }
 
@@ -299,63 +282,49 @@ HTML_DASHBOARD = """
 def home():
     return render_template_string(HTML_DASHBOARD)
 
-@app.route("/register", methods=["POST"])
-def register():
+@app.route("/poll", methods=["POST"])
+def poll():
     data = request.get_json(silent=True) or {}
-    worker_id = data.get("id")
+    worker_id = str(data.get("id"))
+    worker_state = data.get("state", {})
     total_dorks = data.get("total_dorks", 0)
     
     if not worker_id:
         return jsonify({"ok": False, "error": "Missing worker id"}), 400
         
     with workers_lock:
-        workers_data[str(worker_id)] = {
+        workers_data[worker_id] = {
             "total_dorks": total_dorks,
-            "state": {},
-            "last_seen": time.time(),
-            "pending_command": "start"  # Auto-trigger start on worker registration!
+            "state": worker_state,
+            "last_seen": time.time()
         }
-    print(f"[Master] Worker #{worker_id} successfully registered!")
-    return jsonify({"ok": True})
-
-@app.route("/update", methods=["POST"])
-def update_status():
-    data = request.get_json(silent=True) or {}
-    worker_id = data.get("id")
-    worker_state = data.get("state", {})
-    
-    if not worker_id:
-        return jsonify({"ok": False, "error": "Missing worker id"}), 400
         
-    with workers_lock:
-        if str(worker_id) in workers_data:
-            workers_data[str(worker_id)]["state"] = worker_state
-            workers_data[str(worker_id)]["last_seen"] = time.time()
-            
-            # Fetch and clear any pending command for this worker
-            command = workers_data[str(worker_id)].get("pending_command", "idle")
-            workers_data[str(worker_id)]["pending_command"] = "idle"
-            
-            return jsonify({"ok": True, "command": command})
-            
-    return jsonify({"ok": False, "error": "Worker not registered"}), 404
+        # Pop pending commands for this worker
+        commands = pending_commands.get(worker_id, [])
+        pending_commands[worker_id] = []
+        
+    return jsonify({"ok": True, "commands": commands})
 
 @app.route("/status_api")
 def status_api():
     now = time.time()
     formatted_workers = {}
     active_count = 0
+    blocked_count = 0
     
     with workers_lock:
         for w_id, w_info in workers_data.items():
-            is_online = (now - w_info["last_seen"]) < 20  # Online if seen in last 20 seconds
+            is_online = (now - w_info["last_seen"]) < 20  # Online if seen in last 20s
             if is_online:
                 active_count += 1
+                status = w_info.get("state", {}).get("status", "PAUSED")
+                if "BLOCKED" in status or "SUSPENDED" in status or "429" in status:
+                    blocked_count += 1
+                    
             formatted_workers[w_id] = {
                 "total_dorks": w_info["total_dorks"],
                 "state": w_info["state"],
-                "is_online": is_online,
-                "pending_command": w_info.get("pending_command", "idle")
+                "is_online": is_online
             }
             
     # Count unique URLs harvested in global results file if it exists
@@ -369,24 +338,23 @@ def status_api():
             
     return jsonify({
         "active_count": active_count,
+        "blocked_count": blocked_count,
         "total_master_urls": total_master_urls,
         "workers": formatted_workers
     })
 
 @app.route("/control_worker", methods=["POST"])
 def control_worker():
-    w_id = request.args.get("id")
+    w_id = str(request.args.get("id"))
     action = request.args.get("action")  # start, pause, stop
     
     if not w_id or not action:
         return jsonify({"ok": False, "error": "Missing id or action"}), 400
         
     with workers_lock:
-        if str(w_id) in workers_data:
-            workers_data[str(w_id)]["pending_command"] = action
-            return jsonify({"ok": True})
-            
-    return jsonify({"ok": False, "error": "Worker not found"}), 404
+        pending_commands.setdefault(w_id, []).append(action)
+        
+    return jsonify({"ok": True, "message": f"Command '{action}' queued for Worker #{w_id}"})
 
 @app.route("/global_control", methods=["POST"])
 def global_control():
@@ -395,39 +363,12 @@ def global_control():
         return jsonify({"ok": False, "error": "Missing action"}), 400
         
     with workers_lock:
-        for w_id in workers_data:
-            workers_data[w_id]["pending_command"] = action
+        # Send command to all 19 slots
+        for i in range(1, 20):
+            w_id = str(i)
+            pending_commands.setdefault(w_id, []).append(action)
             
-    return jsonify({"ok": True, "success_count": len(workers_data)})
-
-def autoshutdown_check():
-    """Background check: shutdown master cleanly if all registered workers are done or offline."""
-    time.sleep(240)  # 4 minutes grace period for initial startup and registration
-    print("[Master] Shutdown monitor is now active.")
-    while True:
-        try:
-            with workers_lock:
-                total = len(workers_data)
-                if total > 0:
-                    now = time.time()
-                    online_count = sum(1 for w in workers_data.values() if (now - w["last_seen"]) < 45)
-                    active_count = sum(
-                        1 for w in workers_data.values() 
-                        if w.get("state", {}).get("status") in ("RUNNING", "PAUSED", "AUTO-PAUSED")
-                        and (now - w["last_seen"]) < 45
-                    )
-                    
-                    # Exit condition: workers registered, but zero online/active workers remain
-                    if online_count == 0 or active_count == 0:
-                        print("[Master] Auto-Shutdown triggered. All workers have completed, paused, or gone offline.")
-                        os._exit(0)
-        except Exception as e:
-            print(f"[Master Shutdown Monitor Error] {e}")
-        time.sleep(15)
+    return jsonify({"ok": True, "message": f"Global command '{action}' broadcasted to all workers."})
 
 if __name__ == "__main__":
-    # Start auto-shutdown monitor thread
-    threading.Thread(target=autoshutdown_check, daemon=True).start()
-    
-    # Start server
     app.run(host="0.0.0.0", port=5000, threaded=True)
